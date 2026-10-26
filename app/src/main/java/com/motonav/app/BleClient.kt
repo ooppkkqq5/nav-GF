@@ -54,7 +54,6 @@ class BleClient(
 
         private const val HEARTBEAT_MS = 1000
 
-        /** 我们支持的能力：导航 + 触摸命令 */
         private const val OUR_CAPS =
             Proto.CAP_NAVIGATION or Proto.CAP_TOUCH_COMMANDS or Proto.CAP_COMMAND_ACK
     }
@@ -185,6 +184,30 @@ class BleClient(
                 listener.onDisconnected()
                 try { g.close() } catch (_: Exception) { }
                 gatt = null
+            }
+        }
+
+        /**
+         * 配对完成后必须重新订阅 notify。
+         * 固件要求加密连接：第一次写 CCCD 会失败（INSUFFICIENT_ENCRYPTION），
+         * 配对成功后系统不会自动重试，必须手动重新写 CCCD 才能开始握手。
+         */
+        override fun onBondingStateChanged(g: BluetoothGatt, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                listener.onBleLog("配对完成，重新订阅 notify")
+                if (!ready && handshakeStep == 0 && txChar != null) {
+                    try {
+                        g.setCharacteristicNotification(txChar, true)
+                        val desc = txChar!!.getDescriptor(CCCD)
+                        if (desc != null) {
+                            enableNotification(g, desc)
+                        }
+                    } catch (e: Exception) {
+                        listener.onBleLog("重订阅失败: ${e.message}")
+                    }
+                }
+            } else {
+                listener.onBleLog("配对失败: $status")
             }
         }
 
@@ -378,7 +401,6 @@ class BleClient(
 
     // ---------------- 发送 ----------------
 
-    /** 发送一条逻辑消息（自动分片 + 序号） */
     fun sendMessage(type: Int, payload: ByteArray, ackRequested: Boolean = false) {
         val seq = txSequence
         txSequence = if (txSequence >= 65535) 1 else txSequence + 1
@@ -429,7 +451,6 @@ class BleClient(
         }
     }
 
-    /** 由 GATT 回调驱动：一次写完成后继续下一条 */
     fun onWriteCompleted() {
         synchronized(writeQueue) { writing = false }
         pumpQueue()
