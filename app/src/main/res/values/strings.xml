@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Moto 导航</string>
+    <string name="btn_scan">扫描设备</string>
+    <string name="btn_stop">停止扫描</string>
+    <string name="btn_navigate">开始导航</string>
+    <string name="btn_end">结束导航</string>
+    <string name="hint_destination">输入目的地（如：北京 故宫）</string>
+    <string name="status_idle">未连接</string>
+    <string name="notification_channel">导航运行中</string>
+</resources>
