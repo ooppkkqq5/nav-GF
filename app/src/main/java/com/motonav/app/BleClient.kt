@@ -19,7 +19,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
-import android.util.Log
 import java.util.UUID
 
 /**
@@ -48,15 +47,12 @@ class BleClient(
     }
 
     companion object {
-        private const val TAG = "BleClient"
-
         val SERVICE: UUID = UUID.fromString("7e57a000-b50c-4b6a-9c57-40a54e8e1000")
         val RX: UUID = UUID.fromString("7e57a001-b50c-4b6a-9c57-40a54e8e1000")
         val TX: UUID = UUID.fromString("7e57a002-b50c-4b6a-9c57-40a54e8e1000")
         val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         private const val HEARTBEAT_MS = 1000
-        private const val DEFAULT_MTU = 23
 
         /** 我们支持的能力：导航 + 触摸命令 */
         private const val OUR_CAPS =
@@ -70,20 +66,16 @@ class BleClient(
     private var adapter: BluetoothAdapter? = null
     private var scanner: android.bluetooth.le.BluetoothLeScanner? = null
     private var gatt: BluetoothGatt? = null
-
     private var rxChar: BluetoothGattCharacteristic? = null
     private var txChar: BluetoothGattCharacteristic? = null
 
     private var sessionId = 0
     private var txSequence = 1
     private var maxFrameSize = 20
-    private var mtuValue = DEFAULT_MTU
 
-    @Volatile private var handshakeStep = 0   // 0=未开始 1=已发Starting 2=已发Ready
-    @Volatile private var handshakeStartMs = 0L
+    @Volatile private var handshakeStep = 0
     @Volatile private var ready = false
     @Volatile private var scanning = false
-
     private var lastRxMs = 0L
 
     private val heartbeatRunnable = object : Runnable {
@@ -108,8 +100,8 @@ class BleClient(
             listener.onBleLog("蓝牙未开启")
             return
         }
-        if (!hasPerm(android.Manifest.permission.BLUETOOTH_SCAN) &&
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            !hasPerm(android.Manifest.permission.BLUETOOTH_SCAN)) {
             listener.onBleLog("缺少 BLUETOOTH_SCAN 权限")
             return
         }
@@ -131,7 +123,7 @@ class BleClient(
 
     fun stopScan() {
         if (scanning) {
-            try { scanner?.stopScan(scanCallback) } catch (_: Exception) {}
+            try { scanner?.stopScan(scanCallback) } catch (_: Exception) { }
             scanning = false
         }
         listener.onScanStopped()
@@ -166,14 +158,15 @@ class BleClient(
         ready = false
         handshakeStep = 0
         handler.removeCallbacks(heartbeatRunnable)
-        handler.removeCallbacks(handshakeTimeout)
-        try { gatt?.disconnect() } catch (_: Exception) {}
-        try { gatt?.close() } catch (_: Exception) {}
+        try { gatt?.disconnect() } catch (_: Exception) { }
+        try { gatt?.close() } catch (_: Exception) { }
         gatt = null
         rxChar = null
         txChar = null
-        writeQueue.clear()
-        writing = false
+        synchronized(writeQueue) {
+            writeQueue.clear()
+            writing = false
+        }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -188,43 +181,14 @@ class BleClient(
                 ready = false
                 handshakeStep = 0
                 handler.removeCallbacks(heartbeatRunnable)
-                handler.removeCallbacks(handshakeTimeout)
                 synchronized(writeQueue) { writing = false }
                 listener.onDisconnected()
-                try { g.close() } catch (_: Exception) {}
+                try { g.close() } catch (_: Exception) { }
                 gatt = null
             }
         }
 
-        override fun onBondingStateChanged(g: BluetoothGatt, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                listener.onBleLog("配对完成")
-                // CCCD 写入可能因为需要加密而失败；配对完成后重新订阅 notify
-                if (!ready && handshakeStep == 0 && txChar != null) {
-                    try {
-                        g.setCharacteristicNotification(txChar, true)
-                        val desc = txChar!!.getDescriptor(CCCD)
-                        if (desc != null) {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                g.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                            } else {
-                                @Suppress("DEPRECATION")
-                                desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                                @Suppress("DEPRECATION")
-                                g.writeDescriptor(desc)
-                            }
-                        }
-                    } catch (e: Exception) {
-                        listener.onBleLog("重订阅失败: ${e.message}")
-                    }
-                }
-            } else {
-                listener.onBleLog("配对失败: $status")
-            }
-        }
-
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
-            mtuValue = mtu
             maxFrameSize = (mtu - 3).coerceAtMost(512).coerceAtLeast(13)
             listener.onBleLog("MTU=$mtu, maxFrameSize=$maxFrameSize")
             g.discoverServices()
@@ -250,14 +214,7 @@ class BleClient(
             g.setCharacteristicNotification(txChar, true)
             val desc = txChar!!.getDescriptor(CCCD)
             if (desc != null) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    g.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                } else {
-                    @Suppress("DEPRECATION")
-                    desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    @Suppress("DEPRECATION")
-                    g.writeDescriptor(desc)
-                }
+                enableNotification(g, desc)
             } else {
                 listener.onBleLog("警告：TX 缺少 CCCD 描述符")
             }
@@ -272,7 +229,6 @@ class BleClient(
                 listener.onBleLog("TX 通知已开启，开始握手")
                 beginHandshake()
             } else if (status != BluetoothGatt.GATT_SUCCESS) {
-                // 5 = INSUFFICIENT_AUTHENTICATION, 8 = INSUFFICIENT_ENCRYPTION
                 if (status == 5 || status == 8) {
                     listener.onBleLog("需要加密连接，发起配对…")
                     try { g.device.createBond() } catch (e: Exception) {
@@ -293,7 +249,7 @@ class BleClient(
                 listener.onBleLog("写入失败 status=$status")
                 if (status == 5 || status == 8) {
                     listener.onBleLog("需要加密连接，发起配对…")
-                    try { g.device.createBond() } catch (_: Exception) {}
+                    try { g.device.createBond() } catch (_: Exception) { }
                 }
             }
             onWriteCompleted()
@@ -307,14 +263,23 @@ class BleClient(
             handleIncoming(value)
         }
 
-        @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+        @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(
             g: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
         ) {
-            @Suppress("DEPRECATION")
             val v = characteristic.value ?: return
             handleIncoming(v)
+        }
+    }
+
+    /** 写 CCCD 启用 notify（兼容 API 33 前后） */
+    private fun enableNotification(g: BluetoothGatt, desc: BluetoothGattDescriptor) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            g.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+        } else {
+            desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            g.writeDescriptor(desc)
         }
     }
 
@@ -325,7 +290,6 @@ class BleClient(
         txSequence = 1
         handshakeStep = 1
         lastRxMs = System.currentTimeMillis()
-        handshakeStartMs = System.currentTimeMillis()
         val cs = Proto.connectionStatus(
             role = Proto.ROLE_PHONE,
             state = Proto.STATE_STARTING,
@@ -336,17 +300,6 @@ class BleClient(
         )
         sendMessage(Proto.MSG_CONNECTION_STATUS, cs)
         listener.onBleLog("→ ConnectionStatus(Phone, Starting) session=$sessionId")
-        handler.removeCallbacks(handshakeTimeout)
-        handler.postDelayed(handshakeTimeout, 8000)
-    }
-
-    /** 握手超时：设备没回应就重新发起 */
-    private val handshakeTimeout = object : Runnable {
-        override fun run() {
-            if (ready || handshakeStep == 0) return
-            listener.onBleLog("⚠ 8 秒未完成握手，重新发起")
-            beginHandshake()
-        }
     }
 
     private fun handleIncoming(raw: ByteArray) {
@@ -372,34 +325,32 @@ class BleClient(
                     beginHandshake()
                     return
                 }
-                when (state) {
-                    Proto.STATE_READY -> {
-                        if (handshakeStep == 1) {
-                            handshakeStep = 2
-                            maxFrameSize = minOf(maxFrameSize, devMax).coerceAtLeast(13)
-                            val cs = Proto.connectionStatus(
-                                role = Proto.ROLE_PHONE,
-                                state = Proto.STATE_READY,
-                                capabilities = OUR_CAPS,
-                                sessionId = sessionId,
-                                maxFrameSize = maxFrameSize,
-                                heartbeatMs = HEARTBEAT_MS,
-                            )
-                            sendMessage(Proto.MSG_CONNECTION_STATUS, cs)
-                            listener.onBleLog("← Device Ready；→ Phone Ready")
-                        } else if (handshakeStep == 2) {
-                            ready = true
-                            listener.onBleLog("✓ 握手完成，maxFrameSize=$maxFrameSize")
-                            listener.onHandshakeReady(sessionId, maxFrameSize)
-                            handler.removeCallbacks(heartbeatRunnable)
-                            handler.postDelayed(heartbeatRunnable, HEARTBEAT_MS.toLong())
-                        }
+                if (state == Proto.STATE_READY) {
+                    if (handshakeStep == 1) {
+                        handshakeStep = 2
+                        maxFrameSize = minOf(maxFrameSize, devMax).coerceAtLeast(13)
+                        val cs = Proto.connectionStatus(
+                            role = Proto.ROLE_PHONE,
+                            state = Proto.STATE_READY,
+                            capabilities = OUR_CAPS,
+                            sessionId = sessionId,
+                            maxFrameSize = maxFrameSize,
+                            heartbeatMs = HEARTBEAT_MS,
+                        )
+                        sendMessage(Proto.MSG_CONNECTION_STATUS, cs)
+                        listener.onBleLog("← Device Ready；→ Phone Ready")
+                    } else if (handshakeStep == 2) {
+                        ready = true
+                        listener.onBleLog("✓ 握手完成，maxFrameSize=$maxFrameSize")
+                        listener.onHandshakeReady(sessionId, maxFrameSize)
+                        handler.removeCallbacks(heartbeatRunnable)
+                        handler.postDelayed(heartbeatRunnable, HEARTBEAT_MS.toLong())
                     }
-                    Proto.STATE_CLOSING -> {
-                        listener.onBleLog("设备要求关闭连接")
-                        disconnect()
-                    }
-                    else -> listener.onBleLog("设备状态=$state")
+                } else if (state == Proto.STATE_CLOSING) {
+                    listener.onBleLog("设备要求关闭连接")
+                    disconnect()
+                } else {
+                    listener.onBleLog("设备状态=$state")
                 }
             }
 
@@ -439,14 +390,19 @@ class BleClient(
     }
 
     private fun pumpQueue() {
+        val next: ByteArray
         synchronized(writeQueue) {
             if (writing) return
-            val next = writeQueue.removeFirstOrNull() ?: return
+            next = writeQueue.removeFirstOrNull() ?: return
             writing = true
-            writeRaw(next)
         }
+        writeRaw(next)
     }
 
+    /**
+     * GATT 写入必须在主线程执行（Android 强制要求）。
+     * 不能放到线程池再 .get() 阻塞，否则 GATT 回调无法触发，发送队列会卡死。
+     */
     private fun writeRaw(data: ByteArray) {
         val g = gatt
         val ch = rxChar
@@ -455,24 +411,21 @@ class BleClient(
             pumpQueue()
             return
         }
-        // GATT 操作必须在主线程执行（Android 强制要求）。
-        // 不能放到线程池再 .get() 阻塞，否则 GATT 回调无法触发，队列会卡死。
         val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             g.writeCharacteristic(
                 ch, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
             ) == BluetoothGatt.GATT_SUCCESS
         } else {
-            @Suppress("DEPRECATION")
             ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            @Suppress("DEPRECATION")
             ch.value = data
-            @Suppress("DEPRECATION")
             g.writeCharacteristic(ch)
         }
         if (!ok) {
             listener.onBleLog("写入未启动，稍后重试")
             synchronized(writeQueue) { writing = false }
-            handler.postDelayed({ pumpQueue() }, 300)
+            handler.postDelayed(object : Runnable {
+                override fun run() { pumpQueue() }
+            }, 300L)
         }
     }
 
