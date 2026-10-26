@@ -21,7 +21,6 @@ import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
 import java.util.UUID
-import java.util.concurrent.Executors
 
 /**
  * BLE 客户端：连接圆屏、握手、收发协议帧。
@@ -65,7 +64,6 @@ class BleClient(
     }
 
     private val handler = Handler(Looper.getMainLooper())
-    private val gattExecutor = Executors.newSingleThreadExecutor()
     private val writeQueue = ArrayDeque<ByteArray>()
     private var writing = false
 
@@ -82,6 +80,7 @@ class BleClient(
     private var mtuValue = DEFAULT_MTU
 
     @Volatile private var handshakeStep = 0   // 0=未开始 1=已发Starting 2=已发Ready
+    @Volatile private var handshakeStartMs = 0L
     @Volatile private var ready = false
     @Volatile private var scanning = false
 
@@ -167,6 +166,7 @@ class BleClient(
         ready = false
         handshakeStep = 0
         handler.removeCallbacks(heartbeatRunnable)
+        handler.removeCallbacks(handshakeTimeout)
         try { gatt?.disconnect() } catch (_: Exception) {}
         try { gatt?.close() } catch (_: Exception) {}
         gatt = null
@@ -188,9 +188,38 @@ class BleClient(
                 ready = false
                 handshakeStep = 0
                 handler.removeCallbacks(heartbeatRunnable)
+                handler.removeCallbacks(handshakeTimeout)
+                synchronized(writeQueue) { writing = false }
                 listener.onDisconnected()
                 try { g.close() } catch (_: Exception) {}
                 gatt = null
+            }
+        }
+
+        override fun onBondingStateChanged(g: BluetoothGatt, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                listener.onBleLog("配对完成")
+                // CCCD 写入可能因为需要加密而失败；配对完成后重新订阅 notify
+                if (!ready && handshakeStep == 0 && txChar != null) {
+                    try {
+                        g.setCharacteristicNotification(txChar, true)
+                        val desc = txChar!!.getDescriptor(CCCD)
+                        if (desc != null) {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                g.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                            } else {
+                                @Suppress("DEPRECATION")
+                                desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                                @Suppress("DEPRECATION")
+                                g.writeDescriptor(desc)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        listener.onBleLog("重订阅失败: ${e.message}")
+                    }
+                }
+            } else {
+                listener.onBleLog("配对失败: $status")
             }
         }
 
@@ -296,6 +325,7 @@ class BleClient(
         txSequence = 1
         handshakeStep = 1
         lastRxMs = System.currentTimeMillis()
+        handshakeStartMs = System.currentTimeMillis()
         val cs = Proto.connectionStatus(
             role = Proto.ROLE_PHONE,
             state = Proto.STATE_STARTING,
@@ -306,6 +336,17 @@ class BleClient(
         )
         sendMessage(Proto.MSG_CONNECTION_STATUS, cs)
         listener.onBleLog("→ ConnectionStatus(Phone, Starting) session=$sessionId")
+        handler.removeCallbacks(handshakeTimeout)
+        handler.postDelayed(handshakeTimeout, 8000)
+    }
+
+    /** 握手超时：设备没回应就重新发起 */
+    private val handshakeTimeout = object : Runnable {
+        override fun run() {
+            if (ready || handshakeStep == 0) return
+            listener.onBleLog("⚠ 8 秒未完成握手，重新发起")
+            beginHandshake()
+        }
     }
 
     private fun handleIncoming(raw: ByteArray) {
@@ -410,52 +451,35 @@ class BleClient(
         val g = gatt
         val ch = rxChar
         if (g == null || ch == null) {
-            writing = false
+            synchronized(writeQueue) { writing = false }
+            pumpQueue()
             return
         }
-        try {
-            gattExecutor.submit {
-                try {
-                    val done = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        g.writeCharacteristic(
-                            ch, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                        ) == BluetoothGatt.GATT_SUCCESS
-                    } else {
-                        @Suppress("DEPRECATION")
-                        ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                        @Suppress("DEPRECATION")
-                        ch.value = data
-                        @Suppress("DEPRECATION")
-                        g.writeCharacteristic(ch)
-                    }
-                    if (!done) {
-                        handler.post {
-                            writing = false
-                            pumpQueue()
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "write failed", e)
-                    handler.post {
-                        writing = false
-                        pumpQueue()
-                    }
-                }
-            }.get()
-        } catch (e: Exception) {
-            Log.w(TAG, "submit failed", e)
-            writing = false
+        // GATT 操作必须在主线程执行（Android 强制要求）。
+        // 不能放到线程池再 .get() 阻塞，否则 GATT 回调无法触发，队列会卡死。
+        val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            g.writeCharacteristic(
+                ch, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            ) == BluetoothGatt.GATT_SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            @Suppress("DEPRECATION")
+            ch.value = data
+            @Suppress("DEPRECATION")
+            g.writeCharacteristic(ch)
+        }
+        if (!ok) {
+            listener.onBleLog("写入未启动，稍后重试")
+            synchronized(writeQueue) { writing = false }
+            handler.postDelayed({ pumpQueue() }, 300)
         }
     }
 
     /** 由 GATT 回调驱动：一次写完成后继续下一条 */
     fun onWriteCompleted() {
-        handler.post {
-            synchronized(writeQueue) {
-                writing = false
-            }
-            pumpQueue()
-        }
+        synchronized(writeQueue) { writing = false }
+        pumpQueue()
     }
 
     val isReady: Boolean get() = ready
